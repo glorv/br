@@ -5,6 +5,8 @@ import (
 	"context"
 
 	"github.com/pingcap/errors"
+	kvproto "github.com/pingcap/kvproto/pkg/backup"
+	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 
 	"github.com/pingcap/br/pkg/backup"
@@ -13,17 +15,21 @@ import (
 	"github.com/pingcap/br/pkg/utils"
 )
 
-// BackupConfig is the configuration specific for backup tasks.
+// BackupRawConfig is the configuration specific for backup tasks.
 type BackupRawConfig struct {
 	Config
 
 	StartKey []byte
-	EndKey []byte
-	CF string
+	EndKey   []byte
+	CF       string
 }
 
-// DefineBackupRawFlags defines common flags for the backup command.
-func DefineBackupRawFlags(flags *pflag.FlagSet) {
+// DefineRawBackupFlags defines common flags for the backup command.
+func DefineRawBackupFlags(command *cobra.Command) {
+	command.Flags().StringP("format", "", "hex", "start/end key format, support raw|escaped|hex")
+	command.Flags().StringP("cf", "", "default", "backup specify cf, correspond to tikv cf")
+	command.Flags().StringP("start", "", "", "backup raw kv start key, key is inclusive")
+	command.Flags().StringP("end", "", "", "backup raw kv end key, key is exclusive")
 }
 
 // ParseFromFlags parses the backup-related flags from the flag set.
@@ -74,8 +80,6 @@ func RunBackupRaw(c context.Context, cmdName string, cfg *BackupRawConfig) error
 	}
 	defer mgr.Close()
 
-
-
 	client, err := backup.NewBackupClient(ctx, mgr)
 	if err != nil {
 		return err
@@ -95,6 +99,9 @@ func RunBackupRaw(c context.Context, cmdName string, cfg *BackupRawConfig) error
 
 	// The number of regions need to backup
 	approximateRegions, err := mgr.GetRegionCount(ctx, backupRange.StartKey, backupRange.EndKey)
+	if err != nil {
+		return err
+	}
 
 	summary.CollectInt("backup total regions", approximateRegions)
 
@@ -102,8 +109,18 @@ func RunBackupRaw(c context.Context, cmdName string, cfg *BackupRawConfig) error
 	// Redirect to log if there is no log file to avoid unreadable output.
 	updateCh := utils.StartProgress(
 		ctx, cmdName, int64(approximateRegions), !cfg.LogProgress)
+
+	req := kvproto.BackupRequest{
+		StartVersion: 0,
+		EndVersion:   backupTS,
+		RateLimit:    cfg.RateLimit,
+		Concurrency:  cfg.Concurrency,
+		IsRawKv:      true,
+		Cf:           cfg.CF,
+	}
+
 	err = client.BackupRanges(
-		ctx, []backup.Range{backupRange}, backupTS, nil, cfg, updateCh)
+		ctx, []backup.Range{backupRange}, req, updateCh)
 	if err != nil {
 		return err
 	}

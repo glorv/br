@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/pingcap/errors"
+	kvproto "github.com/pingcap/kvproto/pkg/backup"
 	"github.com/pingcap/log"
 	"github.com/pingcap/tidb-tools/pkg/filter"
 	"github.com/spf13/pflag"
@@ -115,8 +116,15 @@ func RunBackup(c context.Context, cmdName string, cfg *BackupConfig) error {
 	// Redirect to log if there is no log file to avoid unreadable output.
 	updateCh := utils.StartProgress(
 		ctx, cmdName, int64(approximateRegions), !cfg.LogProgress)
+
+	req := kvproto.BackupRequest{
+		StartVersion: cfg.LastBackupTS,
+		EndVersion:   backupTS,
+		RateLimit:    cfg.RateLimit,
+		Concurrency:  cfg.Concurrency,
+	}
 	err = client.BackupRanges(
-		ctx, ranges, backupTS, cfg, nil, updateCh)
+		ctx, ranges, req, updateCh)
 	if err != nil {
 		return err
 	}

@@ -106,9 +106,7 @@ func newRawBackupCommand() *cobra.Command {
 			return runBackupRawCommand(command, "Raw Backup")
 		},
 	}
-	command.Flags().StringP("format", "", "hex", "start/end key format, support raw|escaped|hex")
-	command.Flags().StringP("cf", "", "default", "backup specify cf, correspond to tikv cf")
-	command.Flags().StringP("start", "", "", "backup raw kv start key, key is inclusive")
-	command.Flags().StringP("end", "", "", "backup raw kv end key, key is exclusive")
+
+	task.DefineRawBackupFlags(command)
 	return command
 }
