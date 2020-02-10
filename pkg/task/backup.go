@@ -116,7 +116,7 @@ func RunBackup(c context.Context, cmdName string, cfg *BackupConfig) error {
 	updateCh := utils.StartProgress(
 		ctx, cmdName, int64(approximateRegions), !cfg.LogProgress)
 	err = client.BackupRanges(
-		ctx, ranges, cfg.LastBackupTS, backupTS, cfg.RateLimit, cfg.Concurrency, updateCh)
+		ctx, ranges, backupTS, cfg, nil, updateCh)
 	if err != nil {
 		return err
 	}

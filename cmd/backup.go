@@ -1,9 +1,6 @@
 package cmd
 
 import (
-	"bytes"
-
-	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/ddl"
 	"github.com/pingcap/tidb/session"
 	"github.com/spf13/cobra"
@@ -19,6 +16,14 @@ func runBackupCommand(command *cobra.Command, cmdName string) error {
 		return err
 	}
 	return task.RunBackup(GetDefaultContext(), cmdName, &cfg)
+}
+
+func runBackupRawCommand(command *cobra.Command, cmdName string) error {
+	cfg := task.BackupRawConfig{Config: task.Config{LogProgress: HasLogFile()}}
+	if err := cfg.ParseFromFlags(command.Flags()); err != nil {
+		return err
+	}
+	return task.RunBackupRaw(GetDefaultContext(), cmdName, &cfg)
 }
 
 // NewBackupCommand return a full backup subcommand.
@@ -98,33 +103,7 @@ func newRawBackupCommand() *cobra.Command {
 		Use:   "raw",
 		Short: "backup a raw kv range from TiKV cluster",
 		RunE: func(command *cobra.Command, _ []string) error {
-			start, err := command.Flags().GetString("start")
-			if err != nil {
-				return err
-			}
-			startKey, err := utils.ParseKey(command.Flags(), start)
-			if err != nil {
-				return err
-			}
-			end, err := command.Flags().GetString("end")
-			if err != nil {
-				return err
-			}
-			endKey, err := utils.ParseKey(command.Flags(), end)
-			if err != nil {
-				return err
-			}
-
-			cf, err := command.Flags().GetString("cf")
-			if err != nil {
-				return err
-			}
-
-			if bytes.Compare(startKey, endKey) > 0 {
-				return errors.New("input endKey must greater or equal than startKey")
-			}
-			bc := backupContext{startKey: startKey, endKey: endKey, isRawKv: true, cf: cf}
-			return runBackup(command.Flags(), "Raw Backup", bc)
+			return runBackupRawCommand(command, "Raw Backup")
 		},
 	}
 	command.Flags().StringP("format", "", "hex", "start/end key format, support raw|escaped|hex")

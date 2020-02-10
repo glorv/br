@@ -30,6 +30,7 @@ import (
 
 	"github.com/pingcap/br/pkg/storage"
 	"github.com/pingcap/br/pkg/summary"
+	"github.com/pingcap/br/pkg/task"
 	"github.com/pingcap/br/pkg/utils"
 )
 
@@ -245,13 +246,10 @@ func BuildBackupRangeAndSchema(
 func (bc *Client) BackupRanges(
 	ctx context.Context,
 	ranges []Range,
-	lastBackupTS uint64,
 	backupTS uint64,
-	rateLimit uint64,
-	concurrency uint32,
+	cfg *task.BackupConfig,
+	rawCfg *task.BackupRawConfig,
 	updateCh chan<- struct{},
-	isRawKv bool,
-	cf string,
 ) error {
 	start := time.Now()
 	defer func() {
@@ -265,7 +263,7 @@ func (bc *Client) BackupRanges(
 	go func() {
 		for _, r := range ranges {
 			err := bc.backupRange(
-				ctx, r.StartKey, r.EndKey, lastBackupTS, backupTS, rateLimit, concurrency, updateCh, isRawKv, cf)
+				ctx, r.StartKey, r.EndKey, backupTS, cfg, rawCfg, updateCh)
 			if err != nil {
 				errCh <- err
 				return
@@ -308,13 +306,10 @@ func (bc *Client) BackupRanges(
 func (bc *Client) backupRange(
 	ctx context.Context,
 	startKey, endKey []byte,
-	lastBackupTS uint64,
 	backupTS uint64,
-	rateLimit uint64,
-	concurrency uint32,
+	cfg *task.BackupConfig,
+	rawCfg *task.BackupRawConfig,
 	updateCh chan<- struct{},
-	isRawKv bool,
-	cf string,
 ) (err error) {
 	start := time.Now()
 	defer func() {
@@ -330,8 +325,8 @@ func (bc *Client) backupRange(
 	log.Info("backup started",
 		zap.Binary("StartKey", startKey),
 		zap.Binary("EndKey", endKey),
-		zap.Uint64("RateLimit", rateLimit),
-		zap.Uint32("Concurrency", concurrency))
+		zap.Uint64("RateLimit", cfg.RateLimit),
+		zap.Uint32("Concurrency", cfg.Concurrency))
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -345,14 +340,20 @@ func (bc *Client) backupRange(
 		ClusterId:      bc.clusterID,
 		StartKey:       startKey,
 		EndKey:         endKey,
-		StartVersion:   lastBackupTS,
 		EndVersion:     backupTS,
 		StorageBackend: bc.backend,
-		RateLimit:      rateLimit,
-		Concurrency:    concurrency,
-		IsRawKv:        isRawKv,
-		Cf:             cf,
+		RateLimit:      cfg.RateLimit,
+		Concurrency:    cfg.Concurrency,
 	}
+
+	isRawKv := rawCfg != nil
+	if !isRawKv {
+		req.StartVersion = cfg.LastBackupTS
+	} else {
+		req.IsRawKv = true
+		req.Cf = rawCfg.CF
+	}
+
 	push := newPushDown(ctx, bc.mgr, len(allStores))
 
 	var results RangeTree
@@ -365,25 +366,25 @@ func (bc *Client) backupRange(
 	// Find and backup remaining ranges.
 	// TODO: test fine grained backup.
 	err = bc.fineGrainedBackup(
-		ctx, startKey, endKey, lastBackupTS,
-		backupTS, rateLimit, concurrency, results, updateCh)
+		ctx, startKey, endKey, cfg.LastBackupTS,
+		backupTS, cfg.RateLimit, cfg.Concurrency, results, updateCh)
 	if err != nil {
 		return err
 	}
 
-	bc.backupMeta.StartVersion = lastBackupTS
+	bc.backupMeta.StartVersion = cfg.LastBackupTS
 	bc.backupMeta.EndVersion = backupTS
 	bc.backupMeta.IsRawKv = isRawKv
-	if bc.backupMeta.IsRawKv {
+	if isRawKv {
 		bc.backupMeta.RawRanges = append(bc.backupMeta.RawRanges,
-			&backup.RawRange{StartKey: startKey, EndKey: endKey, Cf: cf})
+			&backup.RawRange{StartKey: startKey, EndKey: endKey, Cf: rawCfg.CF})
 		log.Info("backup raw ranges",
 			zap.ByteString("startKey", startKey),
 			zap.ByteString("endKey", endKey),
-			zap.String("cf", cf))
+			zap.String("cf", rawCfg.CF))
 	} else {
 		log.Info("backup time range",
-			zap.Reflect("StartVersion", lastBackupTS),
+			zap.Reflect("StartVersion", cfg.LastBackupTS),
 			zap.Reflect("EndVersion", backupTS))
 	}
 
