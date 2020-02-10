@@ -42,7 +42,7 @@ bin/rawkv --pd $PD_ADDR --mode delete --start-key 31 --end-key 3130303030303030
 
 checksum_new=$(cat /$TEST_DIR/checksum.out | grep result | awk '{print $3}')
 
-if [ "$checksum_ori" -eq "$checksum_new" ];then
+if [ "$checksum_ori" == "$checksum_new" ];then
     echo "TEST: [$TEST_NAME] successed!"
 else
     echo "TEST: [$TEST_NAME] failed!"
