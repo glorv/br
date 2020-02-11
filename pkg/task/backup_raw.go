@@ -19,8 +19,8 @@ import (
 type BackupRawConfig struct {
 	Config
 
-	StartKey []byte `json:"start_key" toml:"start_key"`
-	EndKey   []byte `json:"end_key" toml:"end_key"`
+	StartKey []byte `json:"start-key" toml:"start-key"`
+	EndKey   []byte `json:"end-key" toml:"end-key"`
 	CF       string `json:"cf" toml:"cf"`
 }
 
