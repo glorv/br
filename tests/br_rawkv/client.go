@@ -15,13 +15,6 @@ import (
 	"github.com/prometheus/common/log"
 )
 
-// * Rand Gen
-// * Scan checksum
-// * Scan print
-// * Scan diff
-//
-// Ref TIDB: https://github.com/pingcap/tidb/commit/7a7b2d82a70858544d7b711c9cb8499bda5d6eb7
-
 var (
 	pdAddr      = flag.String("pd", "127.0.0.1:2379", "Address of PD")
 	runMode     = flag.String("mode", "", "Mode. One of 'rand-gen', 'checksum', 'scan' and 'diff'")

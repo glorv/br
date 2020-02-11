@@ -19,9 +19,9 @@ import (
 type BackupRawConfig struct {
 	Config
 
-	StartKey []byte
-	EndKey   []byte
-	CF       string
+	StartKey []byte `json:"start_key" toml:"start_key"`
+	EndKey   []byte `json:"end_key" toml:"end_key"`
+	CF       string `json:"cf" toml:"cf"`
 }
 
 // DefineRawBackupFlags defines common flags for the backup command.
@@ -51,8 +51,8 @@ func (cfg *BackupRawConfig) ParseFromFlags(flags *pflag.FlagSet) error {
 		return err
 	}
 
-	if bytes.Compare(cfg.StartKey, cfg.EndKey) > 0 {
-		return errors.New("input endKey must greater or equal than startKey")
+	if bytes.Compare(cfg.StartKey, cfg.EndKey) >= 0 {
+		return errors.New("endKey must be greater than startKey")
 	}
 
 	cfg.CF, err = flags.GetString("cf")
@@ -88,11 +88,6 @@ func RunBackupRaw(c context.Context, cmdName string, cfg *BackupRawConfig) error
 		return err
 	}
 
-	backupTS, err := client.GetTS(ctx, 0)
-	if err != nil {
-		return err
-	}
-
 	defer summary.Summary(cmdName)
 
 	backupRange := backup.Range{StartKey: cfg.StartKey, EndKey: cfg.EndKey}
@@ -112,7 +107,7 @@ func RunBackupRaw(c context.Context, cmdName string, cfg *BackupRawConfig) error
 
 	req := kvproto.BackupRequest{
 		StartVersion: 0,
-		EndVersion:   backupTS,
+		EndVersion:   0,
 		RateLimit:    cfg.RateLimit,
 		Concurrency:  cfg.Concurrency,
 		IsRawKv:      true,

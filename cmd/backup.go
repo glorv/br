@@ -103,7 +103,7 @@ func newRawBackupCommand() *cobra.Command {
 		Use:   "raw",
 		Short: "backup a raw kv range from TiKV cluster",
 		RunE: func(command *cobra.Command, _ []string) error {
-			return runBackupRawCommand(command, "Raw Backup")
+			return runBackupRawCommand(command, "Raw backup")
 		},
 	}
 
