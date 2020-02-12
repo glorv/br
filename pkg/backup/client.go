@@ -259,7 +259,7 @@ func (bc *Client) BackupRanges(
 	defer cancel()
 	go func() {
 		for _, r := range ranges {
-			err := bc.backupRange(
+			err := bc.BackupRange(
 				ctx, r.StartKey, r.EndKey, req, updateCh)
 			if err != nil {
 				errCh <- err
@@ -299,8 +299,8 @@ func (bc *Client) BackupRanges(
 	}
 }
 
-// backupRange make a backup of the given key range.
-func (bc *Client) backupRange(
+// BackupRange make a backup of the given key range.
+func (bc *Client) BackupRange(
 	ctx context.Context,
 	startKey, endKey []byte,
 	req kvproto.BackupRequest,

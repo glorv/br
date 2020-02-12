@@ -114,8 +114,7 @@ func RunBackupRaw(c context.Context, cmdName string, cfg *BackupRawConfig) error
 		Cf:           cfg.CF,
 	}
 
-	err = client.BackupRanges(
-		ctx, []backup.Range{backupRange}, req, updateCh)
+	err = client.BackupRange(ctx, backupRange.StartKey, backupRange.EndKey, req, updateCh)
 	if err != nil {
 		return err
 	}
