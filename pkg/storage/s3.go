@@ -398,10 +398,11 @@ func (rs *S3Storage) WalkDir(ctx context.Context, opt *WalkOption, fn func(strin
 			return errors.Trace(err)
 		}
 		for _, r := range res.Contents {
+			path := strings.TrimSpace(*r.Key)
 			// when walk on specify directory, the result include storage.Prefix,
 			// which can not be reuse in other API(Open/Read) directly.
 			// so we use TrimPrefix to filter Prefix for next Open/Read.
-			path := strings.TrimPrefix(*r.Key, rs.options.Prefix)
+			path = strings.TrimPrefix(*r.Key, rs.options.Prefix)
 			if err = fn(path, *r.Size); err != nil {
 				return errors.Trace(err)
 			}
