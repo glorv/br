@@ -875,10 +875,12 @@ func (s *tableRestoreSuite) TestTableRestoreMetrics(c *C) {
 
 	chunkPending := metric.ReadCounter(metric.ChunkCounter.WithLabelValues(metric.ChunkStatePending))
 	chunkFinished := metric.ReadCounter(metric.ChunkCounter.WithLabelValues(metric.ChunkStatePending))
+	// total 7 chunks, 6 sql files + 1 csv files
 	c.Assert(chunkPending-chunkPendingBase, Equals, float64(7))
 	c.Assert(chunkFinished-chunkFinishedBase, Equals, chunkPending)
 
 	engineFinished := metric.ReadCounter(metric.ProcessedEngineCounter.WithLabelValues("imported", metric.TableResultSuccess))
+	// 7 data engines + 1 index engine
 	c.Assert(engineFinished-engineFinishedBase, Equals, float64(8))
 
 	tableFinished := metric.ReadCounter(metric.TableCounter.WithLabelValues("index_imported", metric.TableResultSuccess))
