@@ -1240,7 +1240,7 @@ func (local *local) WriteToTiKV(
 	size := int64(0)
 	totalCount := int64(0)
 	firstLoop := true
-	regionMaxSize := local.regionSplitSize * 4 / 3
+	regionMaxSize := engineFile.config.RegionSplitSize * 4 / 3
 
 	for iter.First(); iter.Valid(); iter.Next() {
 		size += int64(len(iter.Key()) + len(iter.Value()))
@@ -1428,7 +1428,7 @@ func (local *local) readAndSplitIntoRange(engineFile *File) ([]Range, error) {
 	}
 
 	ranges := splitRangeBySizeProps(Range{start: firstKey, end: endKey}, sizeProps,
-		local.regionSplitSize, regionMaxKeyCount*2/3)
+		engineFile.config.RegionSplitSize, regionMaxKeyCount*2/3)
 
 	log.L().Info("split engine key ranges", zap.Stringer("engine", engineFile.Uuid),
 		zap.Int64("totalSize", engineFileTotalSize), zap.Int64("totalCount", engineFileLength),
@@ -1847,7 +1847,7 @@ func (local *local) ImportEngine(ctx context.Context, engineUUID uuid.UUID) erro
 
 		// if all the kv can fit in one region, skip split regions. TiDB will split one region for
 		// the table when table is created.
-		needSplit := len(unfinishedRanges) > 1 || lfTotalSize > local.regionSplitSize || lfLength > regionMaxKeyCount
+		needSplit := len(unfinishedRanges) > 1 || lfTotalSize > lf.config.RegionSplitSize || lfLength > regionMaxKeyCount
 		// split region by given ranges
 		for i := 0; i < maxRetryTimes; i++ {
 			err = local.SplitAndScatterRegionByRanges(ctx, unfinishedRanges, needSplit)
