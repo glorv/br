@@ -117,7 +117,7 @@ func (local *local) SplitAndScatterRegionByRanges(ctx context.Context, ranges []
 			idx := sort.Search(len(regions), func(i int) bool {
 				return beforeEnd(startKey, regions[i].Region.EndKey)
 			})
-			if bytes.Compare(startKey, regions[idx].Region.StartKey) <= 0 && bytes.Compare(endKey, regions[idx].Region.EndKey) >= 0 {
+			if bytes.Compare(startKey, regions[idx].Region.StartKey) > 0 || bytes.Compare(endKey, regions[idx].Region.EndKey) < 0 {
 				needSplitRanges = append(needSplitRanges, r)
 			}
 		}

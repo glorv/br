@@ -1461,6 +1461,7 @@ func (t *TableRestore) restoreEngines(pCtx context.Context, rc *RestoreControlle
 				Compact:            threshold > 0,
 				CompactConcurrency: 4,
 				CompactThreshold:   threshold,
+				RegionSplitSize:    int64(rc.cfg.TikvImporter.RegionSplitSize),
 			}
 		}
 		// import backend can't reopen engine if engine is closed, so
@@ -1621,8 +1622,13 @@ func (t *TableRestore) restoreEngine(
 		IsKVSorted: hasAutoIncrementAutoID,
 	}
 
+	engineCfg := &backend.EngineConfig{
+		Local: &backend.LocalEngineConfig{
+			RegionSplitSize: 96 << 20,
+		},
+	}
 	logTask := t.logger.With(zap.Int32("engineNumber", engineID)).Begin(zap.InfoLevel, "encode kv data and write")
-	dataEngine, err := rc.backend.OpenEngine(ctx, &backend.EngineConfig{}, t.tableName, engineID, rc.ts)
+	dataEngine, err := rc.backend.OpenEngine(ctx, engineCfg, t.tableName, engineID, rc.ts)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}

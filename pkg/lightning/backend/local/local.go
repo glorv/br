@@ -1362,11 +1362,18 @@ func splitRangeBySizeProps(fullRange Range, sizeProps *sizeProperties, sizeLimit
 	curKeys := uint64(0)
 	curKey := fullRange.start
 	sizeProps.iter(func(p *rangeProperty) bool {
+		if bytes.Equal(p.Key, engineMetaKey) {
+			return true
+		}
 		curSize += p.Size
 		curKeys += p.Keys
 		if int64(curSize) >= sizeLimit || int64(curKeys) >= keysLimit {
-			ranges = append(ranges, Range{start: curKey, end: p.Key})
-			curKey = p.Key
+			endKey := p.Key
+			if bytes.Equal(curKey, endKey) {
+				endKey = nextKey(endKey)
+			}
+			ranges = append(ranges, Range{start: curKey, end: endKey})
+			curKey = endKey
 			curSize = 0
 			curKeys = 0
 		}
@@ -1410,7 +1417,7 @@ func (local *local) readAndSplitIntoRange(engineFile *File) ([]Range, error) {
 	engineFileLength := engineFile.Length.Load()
 
 	// <= 96MB no need to split into range
-	if engineFileTotalSize <= local.regionSplitSize && engineFileLength <= regionMaxKeyCount {
+	if engineFileTotalSize <= engineFile.config.RegionSplitSize && engineFileLength <= regionMaxKeyCount {
 		ranges := []Range{{start: firstKey, end: endKey, length: int(engineFileLength)}}
 		return ranges, nil
 	}
@@ -1549,6 +1556,7 @@ func (local *local) writeAndIngestByRange(
 			log.ZapRedactBinary("start", start),
 			log.ZapRedactBinary("end", end),
 			log.ZapRedactBinary("next end", nextKey(end)))
+		engineFile.finishedRanges.add(Range{start: start, end: end})
 		return nil
 	}
 	pairStart := append([]byte{}, iter.Key()...)
@@ -1835,14 +1843,14 @@ func (local *local) ImportEngine(ctx context.Context, engineUUID uuid.UUID) erro
 		if len(unfinishedRanges) == 0 {
 			break
 		}
-		log.L().Info("ingest ranges unfinished", zap.Int("count", len(unfinishedRanges)))
+		log.L().Info("import ranges unfinished", zap.Int("count", len(unfinishedRanges)))
 
 		// if all the kv can fit in one region, skip split regions. TiDB will split one region for
 		// the table when table is created.
-		needSplit := len(ranges) > 1 || lfTotalSize > local.regionSplitSize || lfLength > regionMaxKeyCount
+		needSplit := len(unfinishedRanges) > 1 || lfTotalSize > local.regionSplitSize || lfLength > regionMaxKeyCount
 		// split region by given ranges
 		for i := 0; i < maxRetryTimes; i++ {
-			err = local.SplitAndScatterRegionByRanges(ctx, ranges, needSplit)
+			err = local.SplitAndScatterRegionByRanges(ctx, unfinishedRanges, needSplit)
 			if err == nil || common.IsContextCanceledError(err) {
 				break
 			}
@@ -1856,12 +1864,11 @@ func (local *local) ImportEngine(ctx context.Context, engineUUID uuid.UUID) erro
 		}
 
 		// start to write to kv and ingest
-		err = local.writeAndIngestByRanges(ctx, lf, ranges)
+		err = local.writeAndIngestByRanges(ctx, lf, unfinishedRanges)
 		if err != nil {
 			log.L().Error("write and ingest engine failed", log.ShortError(err))
 			return err
 		}
-
 	}
 
 	log.L().Info("import engine success", zap.Stringer("uuid", engineUUID),
