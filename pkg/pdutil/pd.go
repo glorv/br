@@ -511,16 +511,28 @@ func (p *PdController) doPauseConfigs(ctx context.Context, cfg map[string]interf
 	return p.doUpdatePDScheduleConfig(ctx, cfg, post, prefix)
 }
 
-func restoreSchedulers(ctx context.Context, pd *PdController, clusterCfg clusterConfig) error {
+func restoreSchedulers(ctx context.Context, pd *PdController, clusterCfg clusterConfig, modifiedCfg clusterConfig) error {
 	if err := pd.ResumeSchedulers(ctx, clusterCfg.scheduler); err != nil {
 		return errors.Annotate(err, "fail to add PD schedulers")
 	}
 	log.Info("restoring config", zap.Any("config", clusterCfg.scheduleCfg))
+
+	currentCfg, err := pd.GetPDScheduleConfig(ctx)
+	if err != nil {
+		return err
+	}
+
 	mergeCfg := make(map[string]interface{})
 	for cfgKey := range expectPDCfg {
 		value := clusterCfg.scheduleCfg[cfgKey]
 		if value == nil {
 			// Ignore non-exist config.
+			continue
+		}
+		curValue := currentCfg[cfgKey]
+		modifiedValue := modifiedCfg.scheduleCfg[cfgKey]
+		// if the current value is changed after PauseSchedulers, we should not overwrite the updated value.
+		if curValue != modifiedValue {
 			continue
 		}
 		mergeCfg[cfgKey] = value
@@ -538,9 +550,9 @@ func restoreSchedulers(ctx context.Context, pd *PdController, clusterCfg cluster
 	return nil
 }
 
-func (p *PdController) makeUndoFunctionByConfig(config clusterConfig) UndoFunc {
+func (p *PdController) makeUndoFunctionByConfig(config clusterConfig, modifiedCfg clusterConfig) UndoFunc {
 	restore := func(ctx context.Context) error {
-		return restoreSchedulers(ctx, p, config)
+		return restoreSchedulers(ctx, p, config, modifiedCfg)
 	}
 	return restore
 }
@@ -571,7 +583,7 @@ func (p *PdController) RemoveSchedulers(ctx context.Context) (undo UndoFunc, err
 		}
 		disablePDCfg[cfgKey] = cfgValFunc(len(stores), value)
 	}
-	undo = p.makeUndoFunctionByConfig(clusterConfig{scheduleCfg: scheduleCfg})
+	undo = p.makeUndoFunctionByConfig(clusterConfig{scheduleCfg: scheduleCfg}, clusterConfig{scheduleCfg: disablePDCfg})
 	log.Debug("saved PD config", zap.Any("config", scheduleCfg))
 
 	// Remove default PD scheduler that may affect restore process.
@@ -599,7 +611,8 @@ func (p *PdController) RemoveSchedulers(ctx context.Context) (undo UndoFunc, err
 		}
 		removedSchedulers, err = p.pauseSchedulersAndConfigWith(ctx, needRemoveSchedulers, nil, pdRequest)
 	}
-	undo = p.makeUndoFunctionByConfig(clusterConfig{scheduler: removedSchedulers, scheduleCfg: scheduleCfg})
+	undo = p.makeUndoFunctionByConfig(clusterConfig{scheduler: removedSchedulers, scheduleCfg: scheduleCfg},
+		clusterConfig{scheduleCfg: disablePDCfg})
 	return undo, errors.Trace(err)
 }
 
