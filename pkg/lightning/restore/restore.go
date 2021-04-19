@@ -31,6 +31,7 @@ import (
 	"github.com/pingcap/failpoint"
 	sstpb "github.com/pingcap/kvproto/pkg/import_sstpb"
 	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/meta/autoid"
 	"github.com/pingcap/tidb/store/tikv/oracle"
 	"github.com/pingcap/tidb/table"
@@ -59,6 +60,7 @@ import (
 	"github.com/pingcap/br/pkg/pdutil"
 	"github.com/pingcap/br/pkg/storage"
 	"github.com/pingcap/br/pkg/utils"
+	"github.com/pingcap/br/pkg/version"
 	"github.com/pingcap/br/pkg/version/build"
 )
 
@@ -83,6 +85,23 @@ const (
 const (
 	compactionLowerThreshold = 512 << 20 // 512M
 	compactionUpperThreshold = 32 << 30  // 32GB
+
+	// CreateBRIESubJobTable stores the per-table sub jobs information used by TiDB Lightning
+	CreateBRIESubJobTable = `CREATE TABLE IF NOT EXISTS mysql.brie_sub_tasks (
+		task_id 			BIGINT(20) UNSIGNED,
+		table_id 			BIGINT(64) NOT NULL,
+		table_name 			VARCHAR(64) NOT NULL,
+		row_id_base 		BIGINT(20) NOT NULL DEFAULT 0,
+		row_id_max 			BIGINT(20) NOT NULL DEFAULT 0,
+		total_kvs_base 		BIGINT(20) UNSIGNED NOT NULL DEFAULT 0,
+		total_bytes_base 	BIGINT(20) UNSIGNED NOT NULL DEFAULT 0,
+		checksum_base 		BIGINT(20) UNSIGNED NOT NULL DEFAULT 0,
+		total_kvs 			BIGINT(20) UNSIGNED NOT NULL DEFAULT 0,
+		total_bytes 		BIGINT(20) UNSIGNED NOT NULL DEFAULT 0,
+		checksum 			BIGINT(20) UNSIGNED NOT NULL DEFAULT 0,
+		status 				VARCHAR(32) NOT NULL,
+		PRIMARY KEY (table_id, task_id)
+	);`
 )
 
 // DeliverPauser is a shared pauser to pause progress to (*chunkRestore).encodeLoop
@@ -216,6 +235,10 @@ func NewRestoreControllerWithPauser(
 	}
 	if err := verifyCheckpoint(cfg, taskCp); err != nil {
 		return nil, errors.Trace(err)
+	}
+	// reuse task id to reuse task meta correctly.
+	if taskCp != nil {
+		cfg.TaskID = taskCp.TaskID
 	}
 
 	var backend backend.Backend
@@ -671,6 +694,12 @@ func (rc *Controller) restoreSchema(ctx context.Context) error {
 	go rc.listenCheckpointUpdates()
 
 	rc.sysVars = ObtainImportantVariables(ctx, rc.tidbGlue.GetSQLExecutor())
+
+	// TODO: maybe we should not create this table here since user may not have write permission to the `mysql` db.
+	// ensure meta table exists
+	if err := rc.tidbGlue.GetSQLExecutor().ExecuteWithLog(ctx, CreateBRIESubJobTable, "create meta table", log.L()); err != nil {
+		return errors.Annotate(err, "create meta table failed")
+	}
 
 	// Estimate the number of chunks for progress reporting
 	err = rc.estimateChunkCountIntoMetrics(ctx)
@@ -1253,16 +1282,27 @@ func (rc *Controller) restoreTables(ctx context.Context) error {
 	}
 
 	close(postProcessTaskChan)
+	// TODO: support Lightning via SQL
+	db, err := rc.tidbGlue.GetDB()
+	if err != nil {
+		return errors.Trace(err)
+	}
+
 	// otherwise, we should run all tasks in the post-process task chan
 	for i := 0; i < rc.cfg.App.TableConcurrency; i++ {
 		wg.Add(1)
 		go func() {
+			defer wg.Done()
 			for task := range postProcessTaskChan {
+				metaMgr := &tableMetaMgr{
+					session: db,
+					taskID:  rc.cfg.TaskID,
+					tr:      task.tr,
+				}
 				// force all the remain post-process tasks to be executed
-				_, err := task.tr.postProcess(ctx2, rc, task.cp, true)
+				_, err = task.tr.postProcess(ctx2, rc, task.cp, true, metaMgr)
 				restoreErr.Set(err)
 			}
-			wg.Done()
 		}()
 	}
 	wg.Wait()
@@ -1285,6 +1325,18 @@ func (tr *TableRestore) restoreTable(
 	default:
 	}
 
+	// TODO: support Lightning via SQL
+	db, err := rc.tidbGlue.GetDB()
+	if err != nil {
+		return false, errors.Trace(err)
+	}
+
+	metaMgr := &tableMetaMgr{
+		session: db,
+		taskID:  rc.cfg.TaskID,
+		tr:      tr,
+	}
+
 	// no need to do anything if the chunks are already populated
 	if len(cp.Engines) > 0 {
 		tr.logger.Info("reusing engines and files info from checkpoint",
@@ -1292,8 +1344,55 @@ func (tr *TableRestore) restoreTable(
 			zap.Int("filesCnt", cp.CountChunks()),
 		)
 	} else if cp.Status < checkpoints.CheckpointStatusAllWritten {
+		versionStr, err := rc.tidbGlue.GetSQLExecutor().ObtainStringWithLog(
+			ctx, "SELECT version()", "fetch tidb version", log.L())
+		if err != nil {
+			return false, errors.Trace(err)
+		}
+
+		tidbVersion, err := version.ExtractTiDBVersion(versionStr)
+		if err != nil {
+			return false, errors.Trace(err)
+		}
+
 		if err := tr.populateChunks(ctx, rc, cp); err != nil {
 			return false, errors.Trace(err)
+		}
+
+		// fetch the max chunk row_id max value as the global max row_id
+		rowIDMax := int64(0)
+		for _, engine := range cp.Engines {
+			if len(engine.Chunks) > 0 && engine.Chunks[len(engine.Chunks)-1].Chunk.RowIDMax > rowIDMax {
+				rowIDMax = engine.Chunks[len(engine.Chunks)-1].Chunk.RowIDMax
+			}
+		}
+
+		// "show table next_row_id" is only available after v4.0.0
+		if tidbVersion.Major >= 4 && rc.cfg.TikvImporter.Backend != config.BackendTiDB &&
+			(common.TableHasAutoRowID(tr.tableInfo.Core) || tr.tableInfo.Core.GetAutoIncrementColInfo() != nil || tr.tableInfo.Core.ContainsAutoRandomBits()) {
+			// first, insert a new-line into meta table
+			if err = metaMgr.InitTableMeta(ctx); err != nil {
+				return false, err
+			}
+
+			checksum, rowIDBase, err := metaMgr.AllocTableRowIDs(ctx, rowIDMax)
+			if err != nil {
+				return false, err
+			}
+			tr.RebaseChunkRowIDs(cp, rowIDBase)
+
+			if checksum != nil {
+				if cp.Checksum != *checksum {
+					cp.Checksum = *checksum
+					rc.saveCpCh <- saveCp{
+						tableName: tr.tableName,
+						merger: &checkpoints.TableChecksumMerger{
+							Checksum: cp.Checksum,
+						},
+					}
+				}
+				tr.logger.Info("checksum before restore table", zap.Object("checksum", &cp.Checksum))
+			}
 		}
 		if err := rc.checkpointsDB.InsertEngineCheckpoints(ctx, tr.tableName, cp.Engines); err != nil {
 			return false, errors.Trace(err)
@@ -1321,13 +1420,18 @@ func (tr *TableRestore) restoreTable(
 	}
 
 	// 2. Restore engines (if still needed)
-	err := tr.restoreEngines(ctx, rc, cp)
+	err = tr.restoreEngines(ctx, rc, cp)
+	if err != nil {
+		return false, errors.Trace(err)
+	}
+
+	err = metaMgr.updateTableStatus(ctx, metaStatusRestoreFinished)
 	if err != nil {
 		return false, errors.Trace(err)
 	}
 
 	// 3. Post-process. With the last parameter set to false, we can allow delay analyze execute latter
-	return tr.postProcess(ctx, rc, cp, false /* force-analyze */)
+	return tr.postProcess(ctx, rc, cp, false /* force-analyze */, metaMgr)
 }
 
 // estimate SST files compression threshold by total row file size
@@ -1481,10 +1585,6 @@ func (tr *TableRestore) restoreEngines(pCtx context.Context, rc *Controller, cp 
 						setError(err)
 						return
 					}
-
-					failpoint.Inject("FailBeforeDataEngineImported", func() {
-						panic("forcing failure due to FailBeforeDataEngineImported")
-					})
 
 					dataWorker := rc.closedEngineLimit.Apply()
 					defer rc.closedEngineLimit.Recycle(dataWorker)
@@ -1755,6 +1855,7 @@ func (tr *TableRestore) postProcess(
 	rc *Controller,
 	cp *checkpoints.TableCheckpoint,
 	forcePostProcess bool,
+	metaMgr *tableMetaMgr,
 ) (bool, error) {
 	// there are no data in this table, no need to do post process
 	// this is important for tables that are just the dump table of views
@@ -1802,14 +1903,26 @@ func (tr *TableRestore) postProcess(
 			}
 		}
 
+		tr.logger.Info("local checksum", zap.Object("checksum", &localChecksum))
 		if rc.cfg.PostRestore.Checksum == config.OpLevelOff {
 			tr.logger.Info("skip checksum")
 			rc.saveStatusCheckpoint(tr.tableName, checkpoints.WholeTableEngineID, nil, checkpoints.CheckpointStatusChecksumSkipped)
 		} else {
 			if forcePostProcess || !rc.cfg.PostRestore.PostProcessAtLast {
-				tr.logger.Info("local checksum", zap.Object("checksum", &localChecksum))
-				err := tr.compareChecksum(ctx, localChecksum)
+				needChecksum, baseTotalChecksum, err := metaMgr.checkAndUpdateLocalChecksum(ctx, &localChecksum)
+				if err != nil {
+					return false, err
+				}
+				if !needChecksum {
+					return false, nil
+				}
+				if cp.Checksum.SumKVS() > 0 || baseTotalChecksum.SumKVS() > 0 {
+					localChecksum.Add(&cp.Checksum)
+					localChecksum.Add(baseTotalChecksum)
+					tr.logger.Info("merged local checksum", zap.Object("checksum", &localChecksum))
+				}
 
+				err = tr.compareChecksum(ctx, localChecksum)
 				// with post restore level 'optional', we will skip checksum error
 				if rc.cfg.PostRestore.Checksum == config.OpLevelOptional {
 					if err != nil {
@@ -1817,10 +1930,15 @@ func (tr *TableRestore) postProcess(
 						err = nil
 					}
 				}
+				if err == nil {
+					err = metaMgr.FinishTable(ctx)
+				}
+
 				rc.saveStatusCheckpoint(tr.tableName, checkpoints.WholeTableEngineID, err, checkpoints.CheckpointStatusChecksummed)
 				if err != nil {
 					return false, errors.Trace(err)
 				}
+
 				cp.Status = checkpoints.CheckpointStatusChecksummed
 			} else {
 				finished = false
@@ -2027,6 +2145,7 @@ func (rc *Controller) setGlobalVariables(ctx context.Context) error {
 	// we should enable/disable new collation here since in server mode, tidb config
 	// may be different in different tasks
 	collate.SetNewCollationEnabledForTest(enabled)
+
 	return nil
 }
 
@@ -2209,6 +2328,18 @@ func (tr *TableRestore) populateChunks(ctx context.Context, rc *Controller, cp *
 		zap.Int("filesCnt", len(chunks)),
 	)
 	return err
+}
+
+func (t *TableRestore) RebaseChunkRowIDs(cp *checkpoints.TableCheckpoint, rowIDBase int64) {
+	if rowIDBase == 0 {
+		return
+	}
+	for _, engine := range cp.Engines {
+		for _, chunk := range engine.Chunks {
+			chunk.Chunk.PrevRowIDMax += rowIDBase
+			chunk.Chunk.RowIDMax += rowIDBase
+		}
+	}
 }
 
 // initializeColumns computes the "column permutation" for an INSERT INTO
@@ -2709,4 +2840,364 @@ func (cr *chunkRestore) restore(
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+type tableMetaMgr struct {
+	session *sql.DB
+	taskID  int64
+	tr      *TableRestore
+}
+
+func (m *tableMetaMgr) InitTableMeta(ctx context.Context) error {
+	exec := &common.SQLWithRetry{
+		DB:     m.session,
+		Logger: m.tr.logger,
+	}
+	// avoid override existing metadata if the meta is already inserted.
+	stmt := `INSERT IGNORE INTO mysql.brie_sub_tasks (task_id, table_id, table_name, status) values (?, ?, ?, ?)`
+	task := m.tr.logger.Begin(zap.DebugLevel, "init table meta")
+	err := exec.Exec(ctx, "init table meta", stmt, m.taskID, m.tr.tableInfo.ID, m.tr.tableName, metaStatusInitial.String())
+	task.End(zap.ErrorLevel, err)
+	return errors.Trace(err)
+}
+
+type metaStatus uint32
+
+const (
+	metaStatusInitial metaStatus = iota
+	metaStatusRowIDAllocated
+	metaStatusRestoreStarted
+	metaStatusRestoreFinished
+	metaStatusChecksuming
+	metaStatusChecksumSkipped
+	metaStatusFinished
+)
+
+func (m metaStatus) String() string {
+	switch m {
+	case metaStatusInitial:
+		return "initialized"
+	case metaStatusRowIDAllocated:
+		return "allocated"
+	case metaStatusRestoreStarted:
+		return "restore"
+	case metaStatusRestoreFinished:
+		return "restore_finished"
+	case metaStatusChecksuming:
+		return "checksuming"
+	case metaStatusChecksumSkipped:
+		return "checksum_skipped"
+	case metaStatusFinished:
+		return "finish"
+	default:
+		panic(fmt.Sprintf("unexpected metaStatus value '%d'", m))
+	}
+}
+
+func parseMetaStatus(s string) (metaStatus, error) {
+	switch s {
+	case "", "initialized":
+		return metaStatusInitial, nil
+	case "allocated":
+		return metaStatusRowIDAllocated, nil
+	case "restore":
+		return metaStatusRestoreStarted, nil
+	case "restore_finished":
+		return metaStatusRestoreFinished, nil
+	case "checksuming":
+		return metaStatusChecksuming, nil
+	case "checksum_skipped":
+		return metaStatusChecksumSkipped, nil
+	case "finish":
+		return metaStatusFinished, nil
+	default:
+		return metaStatusInitial, errors.Errorf("invalid meta status '%s'", s)
+	}
+}
+
+func (m *tableMetaMgr) AllocTableRowIDs(ctx context.Context, rawRowIDMax int64) (*verify.KVChecksum, int64, error) {
+	conn, err := m.session.Conn(ctx)
+	if err != nil {
+		return nil, 0, errors.Trace(err)
+	}
+	defer conn.Close()
+	exec := &common.SQLWithRetry{
+		DB:     m.session,
+		Logger: m.tr.logger,
+	}
+	var newRowIDBase, newRowIDMax int64
+	curStatus := metaStatusInitial
+	newStatus := metaStatusRowIDAllocated
+	var baseTotalKvs, baseTotalBytes, baseChecksum uint64
+	err = exec.Exec(ctx, "enable pessimistic transaction", "SET SESSION tidb_txn_mode = 'pessimistic';")
+	if err != nil {
+		return nil, 0, errors.Annotate(err, "enable pessimistic transaction failed")
+	}
+	err = exec.Transact(ctx, "init table allocator base", func(ctx context.Context, tx *sql.Tx) error {
+		query := fmt.Sprintf("SELECT task_id, row_id_base, row_id_max, total_kvs_base, total_bytes_base, checksum_base, status from mysql.brie_sub_tasks WHERE table_id = ? FOR UPDATE")
+		rows, err := tx.QueryContext(ctx, query, m.tr.tableInfo.ID)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		defer rows.Close()
+		var (
+			metaTaskID, rowIDBase, rowIDMax, maxRowIDMax int64
+			totalKvs, totalBytes, checksum               uint64
+			statusValue                                  string
+		)
+		for rows.Next() {
+			if err = rows.Scan(&metaTaskID, &rowIDBase, &rowIDMax, &totalKvs, &totalBytes, &checksum, &statusValue); err != nil {
+				return errors.Trace(err)
+			}
+			status, err := parseMetaStatus(statusValue)
+			if err != nil {
+				return errors.Annotatef(err, "invalid meta status '%s'", statusValue)
+			}
+
+			// skip finished meta
+			if status >= metaStatusFinished {
+				continue
+			}
+
+			if metaTaskID == m.taskID {
+				curStatus = status
+				baseChecksum = checksum
+				baseTotalKvs = totalKvs
+				baseTotalBytes = totalBytes
+				if status >= metaStatusRowIDAllocated {
+					if rowIDMax-rowIDBase != rawRowIDMax {
+						return errors.Errorf("verify allocator base failed. local: '%d', meta: '%d'", rawRowIDMax, rowIDMax-rowIDBase)
+					}
+					newRowIDBase = rowIDBase
+					newRowIDMax = rowIDMax
+					break
+				}
+				continue
+			}
+
+			// other tasks has finished this logic, we needn't do again.
+			if status >= metaStatusRowIDAllocated {
+				newStatus = metaStatusRestoreStarted
+			}
+
+			if rowIDMax > maxRowIDMax {
+				maxRowIDMax = rowIDMax
+			}
+		}
+
+		// no enough info are available, fetch row_id max for table
+		if curStatus == metaStatusInitial {
+			if maxRowIDMax == 0 {
+				// NOTE: currently, if a table contains auto_incremental unique key and _tidb_rowid,
+				// the `show table next_row_id` will returns the unique key field only.
+				var autoIDField string
+				for _, col := range m.tr.tableInfo.Core.Columns {
+					if mysql.HasAutoIncrementFlag(col.Flag) {
+						autoIDField = col.Name.L
+						break
+					} else if mysql.HasPriKeyFlag(col.Flag) && m.tr.tableInfo.Core.AutoRandomBits > 0 {
+						autoIDField = col.Name.L
+						break
+					}
+				}
+				if len(autoIDField) == 0 && common.TableHasAutoRowID(m.tr.tableInfo.Core) {
+					autoIDField = model.ExtraHandleName.L
+				}
+				if len(autoIDField) == 0 {
+					return errors.Errorf("table %s contains auto increment id or _tidb_rowid, but target field not found", m.tr.tableName)
+				}
+
+				autoIDInfos, err := tidb.FetchTableAutoIDInfos(ctx, tx, m.tr.tableName)
+				if err != nil {
+					return errors.Trace(err)
+				}
+				found := false
+				for _, info := range autoIDInfos {
+					if strings.ToLower(info.Column) == autoIDField {
+						maxRowIDMax = info.NextID - 1
+						found = true
+						break
+					}
+				}
+				if !found {
+					return errors.Errorf("can't fetch previous auto id base for table %s field '%s'", m.tr.tableName, autoIDField)
+				}
+			}
+			newRowIDBase = maxRowIDMax
+			newRowIDMax = newRowIDBase + rawRowIDMax
+			// table contains no data, can skip checksum
+			if newRowIDBase == 0 && newStatus < metaStatusRestoreStarted {
+				newStatus = metaStatusRestoreStarted
+			}
+			query = "update mysql.brie_sub_tasks set row_id_base = ?, row_id_max = ?, status = ? where table_id = ? and task_id = ?"
+			_, err := tx.ExecContext(ctx, query, newRowIDBase, newRowIDMax, newStatus.String(), m.tr.tableInfo.ID, m.taskID)
+			if err != nil {
+				return errors.Trace(err)
+			}
+
+			curStatus = newStatus
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, 0, errors.Trace(err)
+	}
+
+	var checksum *verify.KVChecksum
+	// need to do checksum and update checksum meta since we are the first one.
+	if curStatus < metaStatusRestoreStarted {
+		// table contains data but haven't do checksum yet
+		if newRowIDBase > 0 && baseTotalKvs == 0 {
+			remoteCk, err := DoChecksum(ctx, m.tr.tableInfo)
+			if err != nil {
+				return nil, 0, errors.Trace(err)
+			}
+
+			if remoteCk.Checksum != baseChecksum || remoteCk.TotalKVs != baseTotalKvs || remoteCk.TotalBytes != baseTotalBytes {
+				ck := verify.MakeKVChecksum(remoteCk.TotalBytes, remoteCk.TotalKVs, remoteCk.Checksum)
+				checksum = &ck
+			}
+
+		}
+
+		if checksum != nil {
+			if err = m.UpdateTableBaseChecksum(ctx, checksum); err != nil {
+				return nil, 0, errors.Trace(err)
+			}
+
+			m.tr.logger.Info("checksum before restore table", zap.Object("checksum", checksum))
+		} else if err = m.updateTableStatus(ctx, metaStatusRestoreStarted); err != nil {
+			return nil, 0, errors.Trace(err)
+		}
+	}
+	if checksum == nil && baseTotalKvs > 0 {
+		ck := verify.MakeKVChecksum(baseTotalBytes, baseTotalKvs, baseChecksum)
+		checksum = &ck
+	}
+	return checksum, newRowIDBase, nil
+}
+
+func (m *tableMetaMgr) UpdateTableBaseChecksum(ctx context.Context, checksum *verify.KVChecksum) error {
+	exec := &common.SQLWithRetry{
+		DB:     m.session,
+		Logger: m.tr.logger,
+	}
+	query := "update mysql.brie_sub_tasks set total_kvs_base = ?, total_bytes_base = ?, checksum_base = ?, status = ? where table_id = ? and task_id = ?"
+
+	return exec.Exec(ctx, "update base checksum", query, checksum.SumKVS(),
+		checksum.SumSize(), checksum.Sum(), metaStatusRestoreStarted.String(), m.tr.tableInfo.ID, m.taskID)
+}
+
+func (m *tableMetaMgr) updateTableStatus(ctx context.Context, status metaStatus) error {
+	exec := &common.SQLWithRetry{
+		DB:     m.session,
+		Logger: m.tr.logger,
+	}
+	query := "update mysql.brie_sub_tasks set status = ? where table_id = ? and task_id = ?"
+	return exec.Exec(ctx, "update meta status", query, status.String(), m.tr.tableInfo.ID, m.taskID)
+}
+
+func (m *tableMetaMgr) checkAndUpdateLocalChecksum(ctx context.Context, checksum *verify.KVChecksum) (bool, *verify.KVChecksum, error) {
+	conn, err := m.session.Conn(ctx)
+	if err != nil {
+		return false, nil, errors.Trace(err)
+	}
+	defer conn.Close()
+	exec := &common.SQLWithRetry{
+		DB:     m.session,
+		Logger: m.tr.logger,
+	}
+	err = exec.Exec(ctx, "enable pessimistic transaction", "SET SESSION tidb_txn_mode = 'pessimistic';")
+	if err != nil {
+		return false, nil, errors.Annotate(err, "enable pessimistic transaction failed")
+	}
+	var (
+		baseTotalKvs, baseTotalBytes, baseChecksum uint64
+		taskKvs, taskBytes, taskChecksum           uint64
+		totalKvs, totalBytes, totalChecksum        uint64
+	)
+	newStatus := metaStatusChecksuming
+	needChecksum := true
+	err = exec.Transact(ctx, "checksum pre-check", func(ctx context.Context, tx *sql.Tx) error {
+		query := fmt.Sprintf("SELECT task_id, total_kvs_base, total_bytes_base, checksum_base, total_kvs, total_bytes, checksum, status from mysql.brie_sub_tasks WHERE table_id = ? FOR UPDATE")
+		rows, err := tx.QueryContext(ctx, query, m.tr.tableInfo.ID)
+		if err != nil {
+			return errors.Annotate(err, "fetch task meta failed")
+		}
+		closed := false
+		defer func() {
+			if !closed {
+				rows.Close()
+			}
+		}()
+		var (
+			taskID      int64
+			statusValue string
+		)
+		for rows.Next() {
+			if err = rows.Scan(&taskID, &baseTotalKvs, &baseTotalBytes, &baseChecksum, &taskKvs, &taskBytes, &taskChecksum, &statusValue); err != nil {
+				return errors.Trace(err)
+			}
+			status, err := parseMetaStatus(statusValue)
+			if err != nil {
+				return errors.Annotatef(err, "invalid meta status '%s'", statusValue)
+			}
+
+			// skip finished meta
+			if status >= metaStatusFinished {
+				continue
+			}
+
+			if taskID == m.taskID {
+				if status > metaStatusChecksuming {
+					newStatus = status
+					needChecksum = status == metaStatusChecksuming
+					return nil
+				}
+
+				continue
+			}
+
+			if status < metaStatusChecksuming {
+				newStatus = metaStatusChecksumSkipped
+				needChecksum = false
+				break
+			} else if status == metaStatusChecksuming {
+				return errors.New("another task is checksuming, there must be something wrong!")
+			}
+
+			totalBytes += baseTotalBytes
+			totalKvs += baseTotalKvs
+			totalChecksum ^= baseChecksum
+
+			totalBytes += taskBytes
+			totalKvs += taskKvs
+			totalChecksum ^= taskChecksum
+		}
+		rows.Close()
+		closed = true
+
+		query = "update mysql.brie_sub_tasks set total_kvs = ?, total_bytes = ?, checksum = ?, status = ? where table_id = ? and task_id = ?"
+		_, err = tx.ExecContext(ctx, query, checksum.SumKVS(), checksum.SumSize(), checksum.Sum(), newStatus.String(), m.tr.tableInfo.ID, m.taskID)
+		return errors.Annotate(err, "update local checksum failed")
+	})
+	if err != nil {
+		return false, nil, err
+	}
+
+	var remoteChecksum *verify.KVChecksum
+	if needChecksum {
+		ck := verify.MakeKVChecksum(totalBytes, totalKvs, totalChecksum)
+		remoteChecksum = &ck
+	}
+	return needChecksum, remoteChecksum, nil
+}
+
+func (m *tableMetaMgr) FinishTable(ctx context.Context) error {
+	exec := &common.SQLWithRetry{
+		DB:     m.session,
+		Logger: m.tr.logger,
+	}
+	query := "DELETE FROM mysql.brie_sub_tasks where table_id = ? and (status = 'checksuming' or status = 'checksum_skipped')"
+	return exec.Exec(ctx, "clean up metas", query, m.tr.tableInfo.ID)
 }
