@@ -72,13 +72,13 @@ func constConfigGeneratorBuilder(val interface{}) pauseConfigGenerator {
 	}
 }
 
-// clusterConfig represents a set of scheduler whose config have been modified
+// ClusterConfig represents a set of scheduler whose config have been modified
 // along with their original config.
-type clusterConfig struct {
+type ClusterConfig struct {
 	// Enable PD schedulers before restore
-	scheduler []string
+	Schedulers []string `json:"schedulers"`
 	// Original scheudle configuration
-	scheduleCfg map[string]interface{}
+	ScheduleCfg map[string]interface{} `json:"schedule_cfg"`
 }
 
 type pauseSchedulerBody struct {
@@ -511,14 +511,14 @@ func (p *PdController) doPauseConfigs(ctx context.Context, cfg map[string]interf
 	return p.doUpdatePDScheduleConfig(ctx, cfg, post, prefix)
 }
 
-func restoreSchedulers(ctx context.Context, pd *PdController, clusterCfg clusterConfig) error {
-	if err := pd.ResumeSchedulers(ctx, clusterCfg.scheduler); err != nil {
+func (p *PdController) RestoreSchedulers(ctx context.Context, clusterCfg ClusterConfig) error {
+	if err := p.ResumeSchedulers(ctx, clusterCfg.Schedulers); err != nil {
 		return errors.Annotate(err, "fail to add PD schedulers")
 	}
-	log.Info("restoring config", zap.Any("config", clusterCfg.scheduleCfg))
+	log.Info("restoring config", zap.Any("config", clusterCfg.ScheduleCfg))
 	mergeCfg := make(map[string]interface{})
 	for cfgKey := range expectPDCfg {
-		value := clusterCfg.scheduleCfg[cfgKey]
+		value := clusterCfg.ScheduleCfg[cfgKey]
 		if value == nil {
 			// Ignore non-exist config.
 			continue
@@ -527,42 +527,57 @@ func restoreSchedulers(ctx context.Context, pd *PdController, clusterCfg cluster
 	}
 
 	prefix := make([]string, 0, 1)
-	if pd.isPauseConfigEnabled() {
+	if p.isPauseConfigEnabled() {
 		// set config's ttl to zero, make temporary config invalid immediately.
 		prefix = append(prefix, fmt.Sprintf("%s?ttlSecond=%d", scheduleConfigPrefix, 0))
 	}
 	// reset config with previous value.
-	if err := pd.doUpdatePDScheduleConfig(ctx, mergeCfg, pdRequest, prefix...); err != nil {
+	if err := p.doUpdatePDScheduleConfig(ctx, mergeCfg, pdRequest, prefix...); err != nil {
 		return errors.Annotate(err, "fail to update PD merge config")
 	}
 	return nil
 }
 
-func (p *PdController) makeUndoFunctionByConfig(config clusterConfig) UndoFunc {
+func (p *PdController) MakeUndoFunctionByConfig(config ClusterConfig) UndoFunc {
 	restore := func(ctx context.Context) error {
-		return restoreSchedulers(ctx, p, config)
+		return p.RestoreSchedulers(ctx, config)
 	}
 	return restore
 }
 
 // RemoveSchedulers removes the schedulers that may slow down BR speed.
 func (p *PdController) RemoveSchedulers(ctx context.Context) (undo UndoFunc, err error) {
+	undo = Nop
+
+	_, removed, err1 := p.RemoveSchedulers2(ctx)
+	if err1 != nil {
+		err = err1
+		return
+	}
+
+	undo = p.MakeUndoFunctionByConfig(ClusterConfig{Schedulers: removed.Schedulers, ScheduleCfg: removed.ScheduleCfg})
+	return undo, errors.Trace(err)
+}
+
+func (p *PdController) RemoveSchedulers2(ctx context.Context) (ClusterConfig, ClusterConfig, error) {
 	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
 		span1 := span.Tracer().StartSpan("PdController.RemoveSchedulers", opentracing.ChildOf(span.Context()))
 		defer span1.Finish()
 		ctx = opentracing.ContextWithSpan(ctx, span1)
 	}
 
-	undo = Nop
+	originCfg := ClusterConfig{}
+	removedCfg := ClusterConfig{}
 	stores, err := p.pdClient.GetAllStores(ctx)
 	if err != nil {
-		return
+		return originCfg, removedCfg, err
 	}
 	scheduleCfg, err := p.GetPDScheduleConfig(ctx)
 	if err != nil {
-		return
+		return originCfg, removedCfg, err
 	}
-	disablePDCfg := make(map[string]interface{})
+	disablePDCfg := make(map[string]interface{}, len(expectPDCfg))
+	originPDCfg := make(map[string]interface{}, len(expectPDCfg))
 	for cfgKey, cfgValFunc := range expectPDCfg {
 		value, ok := scheduleCfg[cfgKey]
 		if !ok {
@@ -570,14 +585,17 @@ func (p *PdController) RemoveSchedulers(ctx context.Context) (undo UndoFunc, err
 			continue
 		}
 		disablePDCfg[cfgKey] = cfgValFunc(len(stores), value)
+		originPDCfg[cfgKey] = value
 	}
-	undo = p.makeUndoFunctionByConfig(clusterConfig{scheduleCfg: scheduleCfg})
+	originCfg.ScheduleCfg = originPDCfg
+	removedCfg.ScheduleCfg = disablePDCfg
+
 	log.Debug("saved PD config", zap.Any("config", scheduleCfg))
 
 	// Remove default PD scheduler that may affect restore process.
 	existSchedulers, err := p.ListSchedulers(ctx)
 	if err != nil {
-		return
+		return originCfg, removedCfg, err
 	}
 	needRemoveSchedulers := make([]string, 0, len(existSchedulers))
 	for _, s := range existSchedulers {
@@ -586,7 +604,29 @@ func (p *PdController) RemoveSchedulers(ctx context.Context) (undo UndoFunc, err
 		}
 	}
 
+	removedSchedulers, err := p.doRemoveSchedulersWith(ctx, needRemoveSchedulers, disablePDCfg)
+	if err != nil {
+		return originCfg, removedCfg, err
+	}
+
+	originCfg.Schedulers = removedSchedulers
+	removedCfg.Schedulers = removedSchedulers
+
+	return originCfg, removedCfg, nil
+}
+
+func (p *PdController) RemoveSchedulersWithCfg(ctx context.Context, removeCfg ClusterConfig) error {
+	_, err := p.doRemoveSchedulersWith(ctx, removeCfg.Schedulers, removeCfg.ScheduleCfg)
+	return err
+}
+
+func (p *PdController) doRemoveSchedulersWith(
+	ctx context.Context,
+	needRemoveSchedulers []string,
+	disablePDCfg map[string]interface{},
+) ([]string, error) {
 	var removedSchedulers []string
+	var err error
 	if p.isPauseConfigEnabled() {
 		// after 4.0.8 we can set these config with TTL
 		removedSchedulers, err = p.pauseSchedulersAndConfigWith(ctx, needRemoveSchedulers, disablePDCfg, pdRequest)
@@ -595,12 +635,11 @@ func (p *PdController) RemoveSchedulers(ctx context.Context) (undo UndoFunc, err
 		// which doesn't have temporary config setting.
 		err = p.doUpdatePDScheduleConfig(ctx, disablePDCfg, pdRequest)
 		if err != nil {
-			return
+			return nil, err
 		}
 		removedSchedulers, err = p.pauseSchedulersAndConfigWith(ctx, needRemoveSchedulers, nil, pdRequest)
 	}
-	undo = p.makeUndoFunctionByConfig(clusterConfig{scheduler: removedSchedulers, scheduleCfg: scheduleCfg})
-	return undo, errors.Trace(err)
+	return removedSchedulers, err
 }
 
 // Close close the connection to pd.

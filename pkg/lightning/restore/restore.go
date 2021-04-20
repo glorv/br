@@ -16,6 +16,7 @@ package restore
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math"
@@ -101,6 +102,14 @@ const (
 		checksum 			BIGINT(20) UNSIGNED NOT NULL DEFAULT 0,
 		status 				VARCHAR(32) NOT NULL,
 		PRIMARY KEY (table_id, task_id)
+	);`
+
+	//
+	CreateBRIEJobTable = `CREATE TABLE IF NOT EXISTS mysql.brie_tasks(
+		task_id BIGINT(20) UNSIGNED NOT NULL,
+		pd_cfgs VARCHAR(2048) NOT NULL DEFAULT '',
+		status  VARCHAR(32) NOT NULL,
+		PRIMARY KEY (task_id)
 	);`
 )
 
@@ -333,7 +342,7 @@ func (rc *Controller) Run(ctx context.Context) error {
 		rc.restoreSchema,
 		rc.restoreTables,
 		rc.fullCompact,
-		rc.switchToNormalMode,
+		//rc.switchToNormalMode,
 		rc.cleanCheckpoints,
 	}
 
@@ -697,8 +706,11 @@ func (rc *Controller) restoreSchema(ctx context.Context) error {
 
 	// TODO: maybe we should not create this table here since user may not have write permission to the `mysql` db.
 	// ensure meta table exists
-	if err := rc.tidbGlue.GetSQLExecutor().ExecuteWithLog(ctx, CreateBRIESubJobTable, "create meta table", log.L()); err != nil {
-		return errors.Annotate(err, "create meta table failed")
+	if err := rc.tidbGlue.GetSQLExecutor().ExecuteWithLog(ctx, CreateBRIEJobTable, "create task meta table", log.L()); err != nil {
+		return errors.Annotate(err, "create task meta table failed")
+	}
+	if err := rc.tidbGlue.GetSQLExecutor().ExecuteWithLog(ctx, CreateBRIESubJobTable, "create table meta table", log.L()); err != nil {
+		return errors.Annotate(err, "create table meta table failed")
 	}
 
 	// Estimate the number of chunks for progress reporting
@@ -948,28 +960,33 @@ func (rc *Controller) listenCheckpointUpdates() {
 	rc.checkpointsWg.Done()
 }
 
-func (rc *Controller) buildRunPeriodicActionAndCancelFunc(ctx context.Context, stop <-chan struct{}) (func(), func()) {
-	cancelFuncs := make([]func(), 0)
+func (rc *Controller) buildRunPeriodicActionAndCancelFunc(ctx context.Context, stop <-chan struct{}) (func(), func(bool)) {
+	cancelFuncs := make([]func(bool), 0)
 
 	// a nil channel blocks forever.
 	// if the cron duration is zero we use the nil channel to skip the action.
 	var logProgressChan <-chan time.Time
 	if rc.cfg.Cron.LogProgress.Duration > 0 {
 		logProgressTicker := time.NewTicker(rc.cfg.Cron.LogProgress.Duration)
-		cancelFuncs = append(cancelFuncs, logProgressTicker.Stop)
+		cancelFuncs = append(cancelFuncs, func(bool) { logProgressTicker.Stop() })
 		logProgressChan = logProgressTicker.C
 	}
 
 	glueProgressTicker := time.NewTicker(3 * time.Second)
-	cancelFuncs = append(cancelFuncs, glueProgressTicker.Stop)
+	cancelFuncs = append(cancelFuncs, func(bool) { glueProgressTicker.Stop() })
 
 	var switchModeChan <-chan time.Time
 	// tidb backend don't need to switch tikv to import mode
 	if rc.cfg.TikvImporter.Backend != config.BackendTiDB && rc.cfg.Cron.SwitchMode.Duration > 0 {
 		switchModeTicker := time.NewTicker(rc.cfg.Cron.SwitchMode.Duration)
-		cancelFuncs = append(cancelFuncs, switchModeTicker.Stop)
-		cancelFuncs = append(cancelFuncs, func() {
-			_ = rc.switchToNormalMode(ctx)
+		cancelFuncs = append(cancelFuncs, func(bool) { switchModeTicker.Stop() })
+		cancelFuncs = append(cancelFuncs, func(do bool) {
+			if do {
+				if err := rc.switchToNormalMode(ctx); err != nil {
+					log.L().Warn("switch tikv to normal mode failed", zap.Error(err))
+				}
+			}
+
 		})
 		switchModeChan = switchModeTicker.C
 
@@ -979,7 +996,7 @@ func (rc *Controller) buildRunPeriodicActionAndCancelFunc(ctx context.Context, s
 	// only local storage has disk quota concern.
 	if rc.cfg.TikvImporter.Backend == config.BackendLocal && rc.cfg.Cron.CheckDiskQuota.Duration > 0 {
 		checkQuotaTicker := time.NewTicker(rc.cfg.Cron.CheckDiskQuota.Duration)
-		cancelFuncs = append(cancelFuncs, checkQuotaTicker.Stop)
+		cancelFuncs = append(cancelFuncs, func(bool) { checkQuotaTicker.Stop() })
 		checkQuotaChan = checkQuotaTicker.C
 	}
 
@@ -1095,9 +1112,9 @@ func (rc *Controller) buildRunPeriodicActionAndCancelFunc(ctx context.Context, s
 					rc.tidbGlue.Record(glue.RecordFinishedChunk, uint64(finished))
 				}
 			}
-		}, func() {
+		}, func(do bool) {
 			for _, f := range cancelFuncs {
-				f()
+				f(do)
 			}
 		}
 }
@@ -1112,6 +1129,9 @@ func (rc *Controller) restoreTables(ctx context.Context) error {
 	// because importer backend is mostly use for v3.x cluster which doesn't support these api,
 	// so we also don't do this for import backend
 	finishSchedulers := func() {}
+	// if one lightning failed abnormally, and can't determine whether it needs to switch back,
+	// we do not do switch back automatically
+	switchBack := false
 	if rc.cfg.TikvImporter.Backend == config.BackendLocal {
 		// disable some pd schedulers
 		pdController, err := pdutil.NewPdController(ctx, rc.cfg.TiDB.PdAddr,
@@ -1119,17 +1139,47 @@ func (rc *Controller) restoreTables(ctx context.Context) error {
 		if err != nil {
 			return errors.Trace(err)
 		}
-		logTask.Info("removing PD leader&region schedulers")
-		restoreFn, e := pdController.RemoveSchedulers(ctx)
-		finishSchedulers = func() {
-			// use context.Background to make sure this restore function can still be executed even if ctx is canceled
-			if restoreE := restoreFn(context.Background()); restoreE != nil {
-				logTask.Warn("failed to restore removed schedulers, you may need to restore them manually", zap.Error(restoreE))
-			}
-			pdController.Close()
-			logTask.Info("add back PD leader&region schedulers")
+
+		db, err := rc.tidbGlue.GetDB()
+		if err != nil {
+			return errors.Trace(err)
 		}
-		if e != nil {
+		mgr := taskMetaMgr{
+			pd:      pdController,
+			taskID:  rc.cfg.TaskID,
+			session: db,
+		}
+
+		if err = mgr.initTask(ctx); err != nil {
+			return err
+		}
+
+		logTask.Info("removing PD leader&region schedulers")
+		restoreFn, err := mgr.checkAndPausePdSchedulers(ctx)
+		finishSchedulers = func() {
+			if restoreFn != nil {
+				// use context.Background to make sure this restore function can still be executed even if ctx is canceled
+				needSwitchBack, err := mgr.CheckAndFinishRestore(context.Background())
+				if err != nil {
+					logTask.Warn("check restore pd schedulers failed", zap.Error(err))
+					return
+				}
+				switchBack = needSwitchBack
+				if needSwitchBack {
+					if restoreE := restoreFn(context.Background()); restoreE != nil {
+						logTask.Warn("failed to restore removed schedulers, you may need to restore them manually", zap.Error(restoreE))
+					}
+					if cleanupErr := mgr.cleanup(context.Background()); cleanupErr != nil {
+						logTask.Warn("failed to clean task metas, you may need to restore them manually", zap.Error(cleanupErr))
+					}
+				}
+
+				logTask.Info("add back PD leader&region schedulers")
+			}
+
+			pdController.Close()
+		}
+		if err != nil {
 			return errors.Trace(err)
 		}
 	}
@@ -1155,7 +1205,7 @@ func (rc *Controller) restoreTables(ctx context.Context) error {
 	defer func() {
 		if !finishFuncCalled {
 			finishSchedulers()
-			finishFunc()
+			finishFunc(switchBack)
 			finishFuncCalled = true
 		}
 	}()
@@ -1309,7 +1359,7 @@ func (rc *Controller) restoreTables(ctx context.Context) error {
 	// stop periodic tasks for restore table such as pd schedulers and switch-mode tasks.
 	// this can help make cluster switching back to normal state more quickly.
 	finishSchedulers()
-	finishFunc()
+	finishFunc(switchBack)
 	finishFuncCalled = true
 
 	close(postProcessTaskChan)
@@ -3186,7 +3236,7 @@ func (m *tableMetaMgr) checkAndUpdateLocalChecksum(ctx context.Context, checksum
 			}
 
 			if taskID == m.taskID {
-				if status > metaStatusChecksuming {
+				if status >= metaStatusChecksuming {
 					newStatus = status
 					needChecksum = status == metaStatusChecksuming
 					return nil
@@ -3237,4 +3287,257 @@ func (m *tableMetaMgr) FinishTable(ctx context.Context) error {
 	}
 	query := "DELETE FROM mysql.brie_sub_tasks where table_id = ? and (status = 'checksuming' or status = 'checksum_skipped')"
 	return exec.Exec(ctx, "clean up metas", query, m.tr.tableInfo.ID)
+}
+
+type taskMetaMgr struct {
+	session *sql.DB
+	taskID  int64
+	pd      *pdutil.PdController
+}
+
+func (m *taskMetaMgr) InitTaskMeta(ctx context.Context) error {
+	exec := &common.SQLWithRetry{
+		DB:     m.session,
+		Logger: log.L(),
+	}
+	// avoid override existing metadata if the meta is already inserted.
+	stmt := `INSERT IGNORE INTO mysql.brie_tasks (task_id, status) values (?, ?)`
+	err := exec.Exec(ctx, "init task meta", stmt, m.taskID, metaStatusInitial.String())
+	return errors.Trace(err)
+}
+
+type taskMetaStatus uint32
+
+const (
+	taskMetaStatusInitial taskMetaStatus = iota
+	taskMetaStatusScheduleSet
+	taskMetaStatusSwitchSkipped
+	taskMetaStatusSwitchBack
+)
+
+func (m taskMetaStatus) String() string {
+	switch m {
+	case taskMetaStatusInitial:
+		return "initialized"
+	case taskMetaStatusScheduleSet:
+		return "schedule_set"
+	case taskMetaStatusSwitchSkipped:
+		return "skip_switch"
+	case taskMetaStatusSwitchBack:
+		return "switched"
+	default:
+		panic(fmt.Sprintf("unexpected metaStatus value '%d'", m))
+	}
+}
+
+func parseTaskMetaStatus(s string) (taskMetaStatus, error) {
+	switch s {
+	case "", "initialized":
+		return taskMetaStatusInitial, nil
+	case "schedule_set":
+		return taskMetaStatusScheduleSet, nil
+	case "skip_switch":
+		return taskMetaStatusSwitchSkipped, nil
+	case "switched":
+		return taskMetaStatusSwitchBack, nil
+	default:
+		return taskMetaStatusInitial, errors.Errorf("invalid meta status '%s'", s)
+	}
+}
+
+type storedCfgs struct {
+	PauseCfg   pdutil.ClusterConfig `json:"paused"`
+	RestoreCFg pdutil.ClusterConfig `json:"restore"`
+}
+
+func (m *taskMetaMgr) initTask(ctx context.Context) error {
+	exec := &common.SQLWithRetry{
+		DB:     m.session,
+		Logger: log.L(),
+	}
+	// avoid override existing metadata if the meta is already inserted.
+	stmt := `INSERT IGNORE INTO mysql.brie_tasks (task_id, status) values (?, ?)`
+	err := exec.Exec(ctx, "init task meta", stmt, m.taskID, taskMetaStatusInitial.String())
+	return errors.Trace(err)
+}
+
+func (m *taskMetaMgr) checkAndPausePdSchedulers(ctx context.Context) (pdutil.UndoFunc, error) {
+	conn, err := m.session.Conn(ctx)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	defer conn.Close()
+	exec := &common.SQLWithRetry{
+		DB:     m.session,
+		Logger: log.L(),
+	}
+	err = exec.Exec(ctx, "enable pessimistic transaction", "SET SESSION tidb_txn_mode = 'pessimistic';")
+	if err != nil {
+		return nil, errors.Annotate(err, "enable pessimistic transaction failed")
+	}
+
+	needSwitch := true
+	paused := false
+	var pausedCfg storedCfgs
+	err = exec.Transact(ctx, "check and pause schedulers", func(ctx context.Context, tx *sql.Tx) error {
+		query := fmt.Sprintf("SELECT task_id, pd_cfgs, status from mysql.brie_tasks FOR UPDATE")
+		rows, err := tx.QueryContext(ctx, query)
+		if err != nil {
+			return errors.Annotate(err, "fetch task meta failed")
+		}
+		closed := false
+		defer func() {
+			if !closed {
+				rows.Close()
+			}
+		}()
+		var (
+			taskID      int64
+			cfg         string
+			statusValue string
+		)
+		var cfgStr string
+		for rows.Next() {
+			if err = rows.Scan(&taskID, &cfg, &statusValue); err != nil {
+				return errors.Trace(err)
+			}
+			status, err := parseTaskMetaStatus(statusValue)
+			if err != nil {
+				return errors.Annotatef(err, "invalid task meta status '%s'", statusValue)
+			}
+
+			if status == taskMetaStatusInitial {
+				continue
+			}
+
+			if taskID == m.taskID {
+				if status >= taskMetaStatusSwitchSkipped {
+					needSwitch = false
+					return nil
+				}
+			}
+
+			if cfg != "" {
+				cfgStr = cfg
+				break
+			}
+		}
+		if err = rows.Close(); err != nil {
+			return errors.Trace(err)
+		}
+		closed = true
+
+		if cfgStr != "" {
+			err = json.Unmarshal([]byte(cfgStr), &pausedCfg)
+			return errors.Trace(err)
+		}
+
+		orig, removed, err := m.pd.RemoveSchedulers2(ctx)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		paused = true
+
+		pausedCfg = storedCfgs{PauseCfg: removed, RestoreCFg: orig}
+		jsonByts, err := json.Marshal(&pausedCfg)
+		if err != nil {
+			return errors.Trace(err)
+		}
+
+		query = "update mysql.brie_tasks set pd_cfgs = ?, status = ? where task_id = ?"
+		_, err = tx.ExecContext(ctx, query, string(jsonByts), taskMetaStatusScheduleSet.String(), m.taskID)
+
+		return errors.Annotate(err, "update task pd configs failed")
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if !needSwitch {
+		return nil, nil
+	}
+
+	if !paused {
+		if err = m.pd.RemoveSchedulersWithCfg(ctx, pausedCfg.PauseCfg); err != nil {
+			return nil, err
+		}
+	}
+
+	return m.pd.MakeUndoFunctionByConfig(pausedCfg.RestoreCFg), nil
+}
+
+func (m *taskMetaMgr) CheckAndFinishRestore(ctx context.Context) (bool, error) {
+	conn, err := m.session.Conn(ctx)
+	if err != nil {
+		return false, errors.Trace(err)
+	}
+	defer conn.Close()
+	exec := &common.SQLWithRetry{
+		DB:     m.session,
+		Logger: log.L(),
+	}
+	err = exec.Exec(ctx, "enable pessimistic transaction", "SET SESSION tidb_txn_mode = 'pessimistic';")
+	if err != nil {
+		return false, errors.Annotate(err, "enable pessimistic transaction failed")
+	}
+
+	switchBack := true
+	err = exec.Transact(ctx, "check and finish schedulers", func(ctx context.Context, tx *sql.Tx) error {
+		query := fmt.Sprintf("SELECT task_id, status from mysql.brie_tasks FOR UPDATE")
+		rows, err := tx.QueryContext(ctx, query)
+		if err != nil {
+			return errors.Annotate(err, "fetch task meta failed")
+		}
+		closed := false
+		defer func() {
+			if !closed {
+				rows.Close()
+			}
+		}()
+		var (
+			taskID      int64
+			statusValue string
+		)
+		newStatus := taskMetaStatusSwitchBack
+		for rows.Next() {
+			if err = rows.Scan(&taskID, &statusValue); err != nil {
+				return errors.Trace(err)
+			}
+			status, err := parseTaskMetaStatus(statusValue)
+			if err != nil {
+				return errors.Annotatef(err, "invalid task meta status '%s'", statusValue)
+			}
+
+			if taskID == m.taskID {
+				continue
+			}
+
+			if status < taskMetaStatusSwitchSkipped {
+				newStatus = taskMetaStatusSwitchSkipped
+				switchBack = false
+				break
+			}
+		}
+		if err = rows.Close(); err != nil {
+			return errors.Trace(err)
+		}
+		closed = true
+
+		query = "update mysql.brie_tasks set status = ? where task_id = ?"
+		_, err = tx.ExecContext(ctx, query, newStatus.String(), m.taskID)
+
+		return errors.Trace(err)
+	})
+
+	return switchBack, err
+}
+
+func (m *taskMetaMgr) cleanup(ctx context.Context) error {
+	exec := &common.SQLWithRetry{
+		DB:     m.session,
+		Logger: log.L(),
+	}
+	// avoid override existing metadata if the meta is already inserted.
+	err := exec.Exec(ctx, "cleanup task meta tables", "DROP TABLE mysql.brie_tasks;")
+	return errors.Trace(err)
 }
