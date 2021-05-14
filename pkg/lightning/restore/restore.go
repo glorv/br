@@ -1619,7 +1619,7 @@ func (tr *TableRestore) restoreEngines(pCtx context.Context, rc *Controller, cp 
 		if rc.cfg.TikvImporter.Backend == config.BackendLocal {
 			// for index engine, the estimate factor is non-clustered index count
 			idxCnt := len(tr.tableInfo.Core.Indices)
-			if common.TableHasAutoRowID(tr.tableInfo.Core) {
+			if !common.TableHasAutoRowID(tr.tableInfo.Core) {
 				idxCnt--
 			}
 			threshold := estimateCompactionThreshold(cp, int64(idxCnt))
@@ -1780,7 +1780,7 @@ func (tr *TableRestore) restoreEngine(
 	// - clustered index disable and primary key is not number
 	// - no auto random bits (auto random or shard rowid)
 	// - no partition table
-	// - no explicit _tidb_rowid field (A this time we can't determine if the soure file contains _tidb_rowid field,
+	// - no explicit _tidb_rowid field (At this time we can't determine if the soure file contains _tidb_rowid field,
 	//   so we will do this check in LocalWriter when the first row is received.)
 	hasAutoIncrementAutoID := common.TableHasAutoRowID(tr.tableInfo.Core) &&
 		tr.tableInfo.Core.AutoRandomBits == 0 && tr.tableInfo.Core.ShardRowIDBits == 0 &&
