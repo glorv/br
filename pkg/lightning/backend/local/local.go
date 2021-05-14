@@ -73,17 +73,17 @@ import (
 )
 
 const (
-	dialTimeout             = 5 * time.Second
+	dialTimeout             = 5 * time.Minute
 	bigValueSize            = 1 << 16 // 64K
 	maxRetryTimes           = 5
 	defaultRetryBackoffTime = 3 * time.Second
 
-	gRPCKeepAliveTime    = 10 * time.Second
-	gRPCKeepAliveTimeout = 3 * time.Second
-	gRPCBackOffMaxDelay  = 3 * time.Second
+	gRPCKeepAliveTime    = 10 * time.Minute
+	gRPCKeepAliveTimeout = 5 * time.Minute
+	gRPCBackOffMaxDelay  = 10 * time.Minute
 
 	// See: https://github.com/tikv/tikv/blob/e030a0aae9622f3774df89c62f21b2171a72a69e/etc/config-template.toml#L360
-	regionMaxKeyCount = 1_440_000
+	regionMaxKeyCount = 1_440_000 * 10
 
 	propRangeIndex = "tikv.range_index"
 
@@ -1235,7 +1235,7 @@ func (local *local) WriteToTiKV(
 	size := int64(0)
 	totalCount := int64(0)
 	firstLoop := true
-	regionMaxSize := local.regionSplitSize * 4 / 3
+	regionMaxSize := engineFile.config.RegionSplitSize * 4 / 3
 
 	for iter.First(); iter.Valid(); iter.Next() {
 		size += int64(len(iter.Key()) + len(iter.Value()))
@@ -1411,7 +1411,7 @@ func (local *local) readAndSplitIntoRange(engineFile *File) ([]Range, error) {
 	engineFileLength := engineFile.Length.Load()
 
 	// <= 96MB no need to split into range
-	if engineFileTotalSize <= local.regionSplitSize && engineFileLength <= regionMaxKeyCount {
+	if engineFileTotalSize <= engineFile.config.RegionSplitSize && engineFileLength <= regionMaxKeyCount {
 		ranges := []Range{{start: firstKey, end: endKey}}
 		return ranges, nil
 	}
@@ -1422,7 +1422,7 @@ func (local *local) readAndSplitIntoRange(engineFile *File) ([]Range, error) {
 	}
 
 	ranges := splitRangeBySizeProps(Range{start: firstKey, end: endKey}, sizeProps,
-		local.regionSplitSize, regionMaxKeyCount*2/3)
+		engineFile.config.RegionSplitSize, regionMaxKeyCount*2/3)
 
 	log.L().Info("split engine key ranges", zap.Stringer("engine", engineFile.UUID),
 		zap.Int64("totalSize", engineFileTotalSize), zap.Int64("totalCount", engineFileLength),
@@ -1830,7 +1830,7 @@ func (local *local) ImportEngine(ctx context.Context, engineUUID uuid.UUID) erro
 
 		// if all the kv can fit in one region, skip split regions. TiDB will split one region for
 		// the table when table is created.
-		needSplit := len(unfinishedRanges) > 1 || lfTotalSize > local.regionSplitSize || lfLength > regionMaxKeyCount
+		needSplit := len(unfinishedRanges) > 1 || lfTotalSize > lf.config.RegionSplitSize || lfLength > regionMaxKeyCount
 		// split region by given ranges
 		for i := 0; i < maxRetryTimes; i++ {
 			err = local.SplitAndScatterRegionByRanges(ctx, unfinishedRanges, needSplit)
