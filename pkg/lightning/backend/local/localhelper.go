@@ -72,6 +72,7 @@ func (local *local) SplitAndScatterRegionByRanges(ctx context.Context, ranges []
 	scatterRegions := make([]*split.RegionInfo, 0)
 	var retryKeys [][]byte
 	waitTime := splitRegionBaseBackOffTime
+	skippedKeys := 0
 	for i := 0; i < SplitRetryTimes; i++ {
 		log.L().Info("split and scatter region",
 			logutil.Key("minKey", minKey),
@@ -242,6 +243,10 @@ func (local *local) SplitAndScatterRegionByRanges(ctx context.Context, ranges []
 		}
 	sendLoop:
 		for regionID, keys := range splitKeyMap {
+			if len(keys) == 1 {
+				skippedKeys++
+				continue
+			}
 			select {
 			case ch <- &splitInfo{region: regionMap[regionID], keys: keys}:
 			case <-ctx.Done():
@@ -276,18 +281,22 @@ func (local *local) SplitAndScatterRegionByRanges(ctx context.Context, ranges []
 
 	startTime := time.Now()
 	scatterCount := 0
-	for _, region := range scatterRegions {
-		local.waitForScatterRegion(ctx, region)
-		if time.Since(startTime) > split.ScatterWaitUpperInterval {
-			break
+	if len(scatterRegions) > 0 {
+		for _, region := range scatterRegions {
+			local.waitForScatterRegion(ctx, region)
+			if time.Since(startTime) > split.ScatterWaitUpperInterval {
+				break
+			}
+			scatterCount++
 		}
-		scatterCount++
 	}
 	if scatterCount == len(scatterRegions) {
 		log.L().Info("waiting for scattering regions done",
+			zap.Int("skipped_keys", skippedKeys),
 			zap.Int("regions", len(scatterRegions)), zap.Duration("take", time.Since(startTime)))
 	} else {
 		log.L().Info("waiting for scattering regions timeout",
+			zap.Int("skipped_keys", skippedKeys),
 			zap.Int("scatterCount", scatterCount),
 			zap.Int("regions", len(scatterRegions)),
 			zap.Duration("take", time.Since(startTime)))
