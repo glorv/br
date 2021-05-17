@@ -200,7 +200,7 @@ func (local *local) SplitAndScatterRegionByRanges(ctx context.Context, ranges []
 									return err1
 								} else if common.IsContextCanceledError(err1) {
 									// do not retry on conext.Canceled error
-									return err1
+									return nil
 								}
 								log.L().Warn("split regions", log.ShortError(err1), zap.Int("retry time", i),
 									zap.Uint64("region_id", region.Region.Id))
@@ -255,7 +255,8 @@ func (local *local) SplitAndScatterRegionByRanges(ctx context.Context, ranges []
 		}
 		close(ch)
 		if splitError := eg.Wait(); splitError != nil {
-			return splitError
+			log.L().Warn("split region failed, will retry.", zap.Error(err))
+			continue
 		}
 
 		if len(retryKeys) == 0 {
@@ -324,6 +325,8 @@ func paginateScanRegion(
 	sort.Slice(regions, func(i, j int) bool {
 		return bytes.Compare(regions[i].Region.StartKey, regions[j].Region.StartKey) < 0
 	})
+	log.L().Info("paginate scan region", zap.Int("count", len(regions)), logutil.Key("start", startKey),
+		logutil.Key("end", endKey))
 	return regions, nil
 }
 

@@ -180,6 +180,8 @@ type File struct {
 func (e *File) setError(err error) {
 	if err != nil {
 		e.ingestErr.Set(err)
+		log.L().Warn("engine met error, cancel process", zap.Stringer("uuid", e.UUID),
+			zap.Error(err))
 		e.cancel()
 	}
 }
@@ -408,6 +410,7 @@ func (e *File) ingestSSTLoop() {
 					if e.config.Compact {
 						newMeta, err := e.sstIngester.mergeSSTs(metas.metas, e.sstDir)
 						if err != nil {
+							log.L().Error("merge ssts failed", zap.Error(err))
 							e.setError(err)
 							return
 						}
@@ -415,6 +418,7 @@ func (e *File) ingestSSTLoop() {
 					}
 
 					if err := e.batchIngestSSTs(ingestMetas); err != nil {
+						log.L().Error("batch ingest ssts failed", zap.Error(err))
 						e.setError(err)
 						return
 					}
@@ -656,7 +660,7 @@ func (e *File) flushEngineWithoutLock(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-e.ctx.Done():
-		return e.ctx.Err()
+		return e.ingestErr.Get()
 	}
 
 	select {
@@ -664,7 +668,7 @@ func (e *File) flushEngineWithoutLock(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-e.ctx.Done():
-		return e.ctx.Err()
+		return e.ingestErr.Get()
 	}
 	if err := e.ingestErr.Get(); err != nil {
 		return errors.Trace(err)
@@ -683,7 +687,7 @@ func (e *File) flushEngineWithoutLock(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-e.ctx.Done():
-		return e.ctx.Err()
+		return e.ingestErr.Get()
 	}
 }
 
@@ -1150,6 +1154,7 @@ func (local *local) CloseEngine(ctx context.Context, engineUUID uuid.UUID) error
 			sstMetasChan: make(chan metaOrFlush),
 		}
 		engineFile.sstIngester = dbSSTIngester{e: engineFile}
+		engineFile.config.RegionSplitSize = 96 * units.MiB
 		engineFile.loadEngineMeta()
 		local.engines.Store(engineUUID, engineFile)
 		return nil
@@ -1866,7 +1871,6 @@ func (local *local) ImportEngine(ctx context.Context, engineUUID uuid.UUID) erro
 		log.L().Info("engine contains no kv, skip import", zap.Stringer("engine", engineUUID))
 		return nil
 	}
-
 	// split sorted file into range by 96MB size per file
 	ranges, err := local.readAndSplitIntoRange(lf)
 	if err != nil {

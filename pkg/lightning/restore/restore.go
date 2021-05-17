@@ -986,7 +986,6 @@ func (rc *Controller) buildRunPeriodicActionAndCancelFunc(ctx context.Context, s
 	var logProgressChan <-chan time.Time
 	if rc.cfg.Cron.LogProgress.Duration > 0 {
 		logProgressTicker := time.NewTicker(rc.cfg.Cron.LogProgress.Duration)
-		defer logProgressTicker.Stop()
 		logProgressChan = logProgressTicker.C
 	}
 
@@ -1810,8 +1809,8 @@ func (tr *TableRestore) restoreEngine(
 		}
 
 		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
+		case <-pCtx.Done():
+			return nil, pCtx.Err()
 		default:
 		}
 
