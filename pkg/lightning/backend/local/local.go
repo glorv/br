@@ -654,7 +654,7 @@ func (e *File) flushEngineWithoutLock(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-e.ctx.Done():
-		return e.ctx.Err()
+		return e.ingestErr.Get()
 	}
 
 	select {
@@ -662,7 +662,7 @@ func (e *File) flushEngineWithoutLock(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-e.ctx.Done():
-		return e.ctx.Err()
+		return e.ingestErr.Get()
 	}
 	if err := e.ingestErr.Get(); err != nil {
 		return errors.Trace(err)
@@ -681,7 +681,7 @@ func (e *File) flushEngineWithoutLock(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-e.ctx.Done():
-		return e.ctx.Err()
+		return e.ingestErr.Get()
 	}
 }
 
@@ -1117,6 +1117,7 @@ func (local *local) CloseEngine(ctx context.Context, engineUUID uuid.UUID) error
 			sstMetasChan: make(chan metaOrFlush),
 		}
 		engineFile.sstIngester = dbSSTIngester{e: engineFile}
+		engineFile.config.RegionSplitSize = 96 * units.MiB
 		engineFile.loadEngineMeta()
 		local.engines.Store(engineUUID, engineFile)
 		return nil

@@ -1810,8 +1810,8 @@ func (tr *TableRestore) restoreEngine(
 		}
 
 		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
+		case <-pCtx.Done():
+			return nil, pCtx.Err()
 		default:
 		}
 
