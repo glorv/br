@@ -41,8 +41,8 @@ import (
 )
 
 const (
-	SplitRetryTimes       = 8
-	retrySplitMaxWaitTime = 4 * time.Second
+	SplitRetryTimes       = 16
+	retrySplitMaxWaitTime = 8 * time.Second
 )
 
 var (
@@ -255,6 +255,7 @@ func (local *local) SplitAndScatterRegionByRanges(ctx context.Context, ranges []
 		}
 		close(ch)
 		if splitError := eg.Wait(); splitError != nil {
+			retryKeys = retryKeys[:0]
 			log.L().Warn("split region failed, will retry.", zap.Error(err))
 			continue
 		}

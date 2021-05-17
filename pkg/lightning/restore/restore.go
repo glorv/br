@@ -1790,7 +1790,7 @@ func (tr *TableRestore) restoreEngine(
 	}
 	engineCfg := &backend.EngineConfig{
 		Local: &backend.LocalEngineConfig{
-			RegionSplitSize: 96 << 20,
+			RegionSplitSize: int64(rc.cfg.TikvImporter.RegionSplitSize),
 		},
 	}
 	logTask := tr.logger.With(zap.Int32("engineNumber", engineID)).Begin(zap.InfoLevel, "encode kv data and write")

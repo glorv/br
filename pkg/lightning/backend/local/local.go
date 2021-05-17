@@ -1154,7 +1154,7 @@ func (local *local) CloseEngine(ctx context.Context, engineUUID uuid.UUID) error
 			sstMetasChan: make(chan metaOrFlush),
 		}
 		engineFile.sstIngester = dbSSTIngester{e: engineFile}
-		engineFile.config.RegionSplitSize = 96 * units.MiB
+		engineFile.config.RegionSplitSize = local.regionSplitSize
 		engineFile.loadEngineMeta()
 		local.engines.Store(engineUUID, engineFile)
 		return nil
