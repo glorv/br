@@ -16,6 +16,8 @@ package local
 import (
 	"bytes"
 	"context"
+	"database/sql"
+	"github.com/pingcap/br/pkg/lightning/checkpoints"
 	"regexp"
 	"runtime"
 	"sort"
@@ -60,15 +62,19 @@ var (
 // This File include region split & scatter operation just like br.
 // we can simply call br function, but we need to change some function signature of br
 // When the ranges total size is small, we can skip the split to avoid generate empty regions.
-func (local *local) SplitAndScatterRegionByRanges(ctx context.Context, ranges []Range, needSplit bool) error {
+func (local *local) SplitAndScatterRegionByRanges(ctx context.Context, tableInfo *checkpoints.TidbTableInfo, ranges []Range, needSplit bool) error {
 	if len(ranges) == 0 {
 		return nil
+	}
+
+	db, err := local.g.GetDB()
+	if err != nil {
+		return errors.Trace(err)
 	}
 
 	minKey := codec.EncodeBytes([]byte{}, ranges[0].start)
 	maxKey := codec.EncodeBytes([]byte{}, ranges[len(ranges)-1].end)
 
-	var err error
 	scatterRegions := make([]*split.RegionInfo, 0)
 	var retryKeys [][]byte
 	waitTime := splitRegionBaseBackOffTime
@@ -111,6 +117,12 @@ func (local *local) SplitAndScatterRegionByRanges(ctx context.Context, ranges []
 		if !needSplit {
 			scatterRegions = append(scatterRegions, regions...)
 			break
+		}
+
+		tableRegionStats, err1 := fetchTableRegionSizeStats(ctx, db, tableInfo.ID)
+		if err != nil {
+			err = err1
+			continue
 		}
 
 		needSplitRanges := make([]Range, 0, len(ranges))
@@ -243,7 +255,13 @@ func (local *local) SplitAndScatterRegionByRanges(ctx context.Context, ranges []
 		}
 	sendLoop:
 		for regionID, keys := range splitKeyMap {
-			if len(keys) == 1 {
+			// if region not in tableRegionStats, that means this region is newly split, so
+			// we can skip split it again.
+			regionSize, ok := tableRegionStats[regionID]
+			if !ok {
+				log.L().Warn("region stats not found", zap.Uint64("region", regionID))
+			}
+			if len(keys) == 1 && regionSize < local.regionSplitSize {
 				skippedKeys++
 				continue
 			}
@@ -302,6 +320,35 @@ func (local *local) SplitAndScatterRegionByRanges(ctx context.Context, ranges []
 			zap.Duration("take", time.Since(startTime)))
 	}
 	return nil
+}
+
+func fetchTableRegionSizeStats(ctx context.Context, db *sql.DB, tableID int64) (map[uint64]int64, error) {
+	exec := &common.SQLWithRetry{
+		DB:     db,
+		Logger: log.L(),
+	}
+
+	stats := make(map[uint64]int64)
+	err := exec.Transact(ctx, "fetch region approximate sizes", func(ctx context.Context, tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, "SELECT REGION_ID, APPROXIMATE_SIZE FROM information_schema.TIKV_REGION_STATUS WHERE TABLE_ID = ?", tableID)
+		if err != nil {
+			return errors.Trace(err)
+		}
+
+		defer rows.Close()
+		var (
+			regionID uint64
+			size     int64
+		)
+		for rows.Next() {
+			if err = rows.Scan(&regionID, &size); err != nil {
+				return errors.Trace(err)
+			}
+			stats[regionID] = size * units.MiB
+		}
+		return rows.Err()
+	})
+	return stats, errors.Trace(err)
 }
 
 func paginateScanRegion(

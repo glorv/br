@@ -1896,7 +1896,7 @@ func (local *local) ImportEngine(ctx context.Context, engineUUID uuid.UUID) erro
 		needSplit := len(unfinishedRanges) > 1 || lfTotalSize > lf.config.RegionSplitSize || lfLength > regionMaxKeyCount
 		// split region by given ranges
 		for i := 0; i < maxRetryTimes; i++ {
-			err = local.SplitAndScatterRegionByRanges(ctx, unfinishedRanges, needSplit)
+			err = local.SplitAndScatterRegionByRanges(ctx, lf.config.TableInfo, unfinishedRanges, needSplit)
 			if err == nil || common.IsContextCanceledError(err) {
 				break
 			}

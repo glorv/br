@@ -16,6 +16,7 @@ package backend
 import (
 	"context"
 	"fmt"
+	"github.com/pingcap/br/pkg/lightning/checkpoints"
 	"sort"
 	"time"
 
@@ -114,7 +115,8 @@ type LocalEngineConfig struct {
 	CompactThreshold int64
 	// compact routine concurrency
 	CompactConcurrency int
-	RegionSplitSize int64
+	RegionSplitSize    int64
+	TableInfo          *checkpoints.TidbTableInfo
 }
 
 // CheckCtx contains all parameters used in CheckRequirements
