@@ -1797,9 +1797,25 @@ func (tr *TableRestore) restoreEngine(
 	}
 
 	logTask := tr.logger.With(zap.Int32("engineNumber", engineID)).Begin(zap.InfoLevel, "encode kv data and write")
+
+	// try restrict the total file number within 512
+	threshold := int64(rc.cfg.Mydumper.BatchSize) / 512
+	threshold = utils.NextPowerOfTwo(threshold)
+	compact := true
+	if threshold < compactionLowerThreshold {
+		// disable compaction if threshold is smaller than lower bound
+		threshold = 0
+		compact = false
+	} else if threshold > compactionUpperThreshold {
+		threshold = compactionUpperThreshold
+	}
 	dataEngineCfg := &backend.EngineConfig{
 		TableInfo: tr.tableInfo,
-		Local:     &backend.LocalEngineConfig{},
+		Local: &backend.LocalEngineConfig{
+			Compact:            compact,
+			CompactConcurrency: 8,
+			CompactThreshold:   threshold,
+		},
 	}
 	dataEngine, err := rc.backend.OpenEngine(ctx, dataEngineCfg, tr.tableName, engineID)
 	if err != nil {
